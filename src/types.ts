@@ -1,0 +1,87 @@
+/**
+ * Shared types for VibeAround channel plugins.
+ *
+ * Re-exports the ACP SDK types plugins commonly need, plus SDK-specific types
+ * for block rendering, plugin manifests, and verbose configuration.
+ */
+
+// Re-export ACP SDK types so plugin authors only need one import
+export type {
+  Agent,
+  Client,
+  SessionNotification,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+} from "@agentclientprotocol/sdk";
+
+// ---------------------------------------------------------------------------
+// Plugin manifest
+// ---------------------------------------------------------------------------
+
+export interface PluginCapabilities {
+  /** Plugin supports real-time streaming updates. */
+  streaming?: boolean;
+  /** Platform supports rich interactive cards (e.g. Feishu). */
+  interactiveCards?: boolean;
+  /** Platform supports editing already-sent messages. */
+  editMessage?: boolean;
+  /** Platform supports file upload/download. */
+  media?: boolean;
+  auth?: { methods?: string[] };
+}
+
+/** Shape of plugin.json — the plugin manifest file. */
+export interface PluginManifest {
+  id: string;
+  name: string;
+  kind: "channel";
+  runtime: "node";
+  entry: string;
+  build?: string;
+  configSchema?: Record<string, unknown>;
+  capabilities?: PluginCapabilities;
+}
+
+// ---------------------------------------------------------------------------
+// Block rendering
+// ---------------------------------------------------------------------------
+
+/** The three kinds of content blocks a plugin renders. */
+export type BlockKind = "text" | "thinking" | "tool";
+
+export interface VerboseConfig {
+  /** Show agent thinking/reasoning blocks. Default: false. */
+  showThinking: boolean;
+  /** Show tool call / tool result blocks. Default: false. */
+  showToolUse: boolean;
+}
+
+export interface BlockRendererOptions {
+  /**
+   * Debounce interval before flushing an unsealed block (ms).
+   * Controls how often in-progress blocks are sent to the platform.
+   * Default: 500.
+   */
+  flushIntervalMs?: number;
+  /**
+   * Minimum interval between consecutive edits to the same message (ms).
+   * Prevents hitting platform API rate limits.
+   * Default: 1000.
+   */
+  minEditIntervalMs?: number;
+  verbose?: Partial<VerboseConfig>;
+}
+
+// ---------------------------------------------------------------------------
+// Init / config
+// ---------------------------------------------------------------------------
+
+/**
+ * Plugin config and metadata passed by the host in `_meta` during initialize.
+ */
+export interface PluginInitMeta {
+  /** Plugin-specific config object from settings.json. */
+  config: Record<string, unknown>;
+  /** Host-provided cache directory path for temporary files. */
+  cacheDir?: string;
+}
