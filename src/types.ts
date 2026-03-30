@@ -9,6 +9,7 @@
 export type {
   Agent,
   Client,
+  ContentBlock,
   SessionNotification,
   RequestPermissionRequest,
   RequestPermissionResponse,

@@ -65,6 +65,7 @@ export type {
   // ACP SDK
   Agent,
   Client,
+  ContentBlock,
   SessionNotification,
   RequestPermissionRequest,
   RequestPermissionResponse,
