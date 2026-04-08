@@ -57,6 +57,44 @@ import type { SessionNotification } from "@agentclientprotocol/sdk";
 import type { BlockKind, BlockRendererOptions, VerboseConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
+// Local ACP session-update narrowing
+// ---------------------------------------------------------------------------
+//
+// The ACP SDK's `SessionNotification.update` is a discriminated union keyed on
+// the `sessionUpdate` field, but the shape we get back at runtime varies by
+// version. We only consume four variants here, so we define a narrow local
+// view that documents exactly the fields this renderer depends on. A mismatch
+// against the upstream type will show up as a compile error when the SDK is
+// bumped, instead of silently producing `undefined` at runtime.
+
+interface AgentMessageChunk {
+  sessionUpdate: "agent_message_chunk";
+  content?: { text?: string };
+}
+
+interface AgentThoughtChunk {
+  sessionUpdate: "agent_thought_chunk";
+  content?: { text?: string };
+}
+
+interface ToolCall {
+  sessionUpdate: "tool_call";
+  title?: string;
+}
+
+interface ToolCallUpdate {
+  sessionUpdate: "tool_call_update";
+  title?: string;
+  status?: string;
+}
+
+type ConsumedSessionUpdate =
+  | AgentMessageChunk
+  | AgentThoughtChunk
+  | ToolCall
+  | ToolCallUpdate;
+
+// ---------------------------------------------------------------------------
 // Internal state types
 // ---------------------------------------------------------------------------
 
@@ -210,38 +248,49 @@ export abstract class BlockRenderer<TRef = string> {
    */
   onSessionUpdate(notification: SessionNotification): void {
     const sessionId = notification.sessionId;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const update = notification.update as any;
-    const variant = update.sessionUpdate as string;
+    // Narrow through the local ConsumedSessionUpdate union — see the type
+    // declaration above this class for why we re-declare it locally instead
+    // of importing the SDK's own union. Variants other than the four we
+    // handle are treated as no-ops.
+    const rawUpdate = notification.update as unknown as { sessionUpdate: string };
+    const variant = rawUpdate.sessionUpdate;
+    if (
+      variant !== "agent_message_chunk" &&
+      variant !== "agent_thought_chunk" &&
+      variant !== "tool_call" &&
+      variant !== "tool_call_update"
+    ) {
+      return;
+    }
+    const update = rawUpdate as ConsumedSessionUpdate;
     const channelId = this.sessionIdToChannelId(sessionId);
 
-    switch (variant) {
+    switch (update.sessionUpdate) {
       case "agent_message_chunk": {
-        const delta = (update.content?.text ?? "") as string;
+        const delta = update.content?.text ?? "";
         if (delta) this.appendToBlock(channelId, "text", delta);
         break;
       }
       case "agent_thought_chunk": {
         if (!this.verbose.showThinking) return; // skip — no block, no boundary
-        const delta = (update.content?.text ?? "") as string;
+        const delta = update.content?.text ?? "";
         if (delta) this.appendToBlock(channelId, "thinking", delta);
         break;
       }
       case "tool_call": {
         if (!this.verbose.showToolUse) return; // skip
-        const title = update.title as string | undefined;
-        if (title) this.appendToBlock(channelId, "tool", `🔧 ${title}\n`);
+        if (update.title) this.appendToBlock(channelId, "tool", `🔧 ${update.title}\n`);
         break;
       }
       case "tool_call_update": {
         if (!this.verbose.showToolUse) return; // skip
-        const title = (update.title ?? "tool") as string;
-        const status = update.status as string | undefined;
-        if (status === "completed" || status === "error") {
+        const title = update.title ?? "tool";
+        if (update.status === "completed" || update.status === "error") {
           this.appendToBlock(channelId, "tool", `✅ ${title}\n`);
         }
         break;
       }
+      // Unknown / unconsumed variant — ignore.
     }
   }
 

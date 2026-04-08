@@ -57,8 +57,23 @@
 export { connectToHost, normalizeExtMethod, redirectConsoleToStderr } from "./connection.js";
 export type { PluginInfo, ConnectResult, AgentInfo } from "./connection.js";
 
+// Error normalization
+export { extractErrorMessage } from "./errors.js";
+
+// Plugin runner (absorbs the main.ts boilerplate)
+export { runChannelPlugin } from "./run-plugin.js";
+export type {
+  ChannelBot,
+  ChannelPluginLogger,
+  ChannelStreamHandler,
+  CreateBotContext,
+  RunChannelPluginSpec,
+  VerboseOptions,
+} from "./run-plugin.js";
+
 // Block renderer
 export { BlockRenderer } from "./renderer.js";
+
 
 // Types (re-exports ACP SDK types + SDK-specific types)
 export type {
