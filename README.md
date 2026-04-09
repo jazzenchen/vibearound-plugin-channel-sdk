@@ -46,7 +46,7 @@ class MyRenderer extends BlockRenderer<string> {
 const renderer = new MyRenderer({ minEditIntervalMs: 600 });
 
 const { agent, meta, agentInfo, conn } = await connectToHost(
-  { name: "vibearound-myplatform", version: "0.1.0" },
+  { name: "vibearound-myplatform", version: "0.3.0" },
   (_agent) => ({
     async sessionUpdate(params: SessionNotification) {
       renderer.onSessionUpdate(params);
@@ -118,7 +118,7 @@ Each channel plugin needs a `plugin.json` at its root:
 {
   "id": "my-platform",
   "name": "My Platform Channel",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "kind": "channel",
   "runtime": "node",
   "entry": "dist/main.js",
