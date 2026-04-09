@@ -398,6 +398,17 @@ export abstract class BlockRenderer<TRef = string> {
     const block = state.blocks.at(-1);
     if (!block || block.sealed || !block.content) return;
 
+    // Send-only mode: subclasses that don't override `editBlock` (e.g.
+    // QQ Bot, where the platform has no edit support) would otherwise
+    // POST a new message for every debounced flush, so the user sees a
+    // partial chunk followed by the full message as two separate
+    // deliveries. Defer intermediate sends; only `onTurnEnd` and block
+    // boundary transitions inside `appendToBlock` (which seal the block
+    // first) will actually POST.
+    if (!this.editBlock) {
+      return;
+    }
+
     const now = Date.now();
     if (now - state.lastEditMs < this.minEditIntervalMs) {
       // Throttled — reschedule for the remaining window
