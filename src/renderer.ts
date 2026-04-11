@@ -27,11 +27,11 @@
  *
  * ```ts
  * class MyRenderer extends BlockRenderer<string> {
- *   protected async sendBlock(channelId, kind, content) {
- *     const msg = await myApi.sendMessage(channelId, content);
+ *   protected async sendBlock(chatId, kind, content) {
+ *     const msg = await myApi.sendMessage(chatId, content);
  *     return msg.id;
  *   }
- *   protected async editBlock(channelId, ref, kind, content, sealed) {
+ *   protected async editBlock(chatId, ref, kind, content, sealed) {
  *     await myApi.editMessage(ref, content);
  *   }
  * }
@@ -40,12 +40,12 @@
  * const renderer = new MyRenderer({ verbose: { showThinking: false } });
  *
  * // When user sends a message:
- * renderer.onPromptSent(channelId);
+ * renderer.onPromptSent(chatId);
  * try {
  *   await agent.prompt({ sessionId, content });
- *   await renderer.onTurnEnd(channelId);
+ *   await renderer.onTurnEnd(chatId);
  * } catch (e) {
- *   await renderer.onTurnError(channelId, String(e));
+ *   await renderer.onTurnError(chatId, String(e));
  * }
  *
  * // In the ACP client's sessionUpdate handler:
@@ -100,7 +100,7 @@ type ConsumedSessionUpdate =
 
 interface ManagedBlock<TRef> {
   /** Channel this block belongs to. Captured at creation time. */
-  channelId: string;
+  chatId: string;
   kind: BlockKind;
   content: string;
   /** Platform message reference set after the first successful send. */
@@ -145,6 +145,10 @@ export abstract class BlockRenderer<TRef = string> {
 
   private states = new Map<string, ChannelState<TRef>>();
 
+  /** The chatId of the most recent prompt. Used as fallback target for
+   *  notifications that arrive without an explicit chatId. */
+  private lastActiveChatId: string | null = null;
+
   constructor(options: BlockRendererOptions = {}) {
     this.flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
     this.minEditIntervalMs = options.minEditIntervalMs ?? DEFAULT_MIN_EDIT_INTERVAL_MS;
@@ -155,20 +159,30 @@ export abstract class BlockRenderer<TRef = string> {
   }
 
   // ---------------------------------------------------------------------------
-  // Abstract / overridable — subclass implements these
+  // Abstract — plugin MUST implement these
   // ---------------------------------------------------------------------------
 
   /**
-   * Send a new block message to the platform.
+   * Send a plain text message to the IM. Used for system text, agent ready
+   * notifications, session ready, and error messages.
+   */
+  protected abstract sendText(chatId: string, text: string): Promise<void>;
+
+  /**
+   * Send a new streaming block message to the platform.
    *
    * Return the platform message reference that will be passed to future
    * `editBlock` calls. Return `null` if editing is not supported.
    */
   protected abstract sendBlock(
-    channelId: string,
+    chatId: string,
     kind: BlockKind,
     content: string,
   ): Promise<TRef | null>;
+
+  // ---------------------------------------------------------------------------
+  // Optional overrides — plugin MAY implement these
+  // ---------------------------------------------------------------------------
 
   /**
    * Edit an existing block message in-place.
@@ -180,7 +194,7 @@ export abstract class BlockRenderer<TRef = string> {
    *   Use to switch from a "streaming" card format to a finalized one.
    */
   protected editBlock?(
-    channelId: string,
+    chatId: string,
     ref: TRef,
     kind: BlockKind,
     content: string,
@@ -207,31 +221,18 @@ export abstract class BlockRenderer<TRef = string> {
 
   /**
    * Called after the last block has been flushed and the turn is complete.
-   * Override to perform cleanup (e.g. remove a "typing" indicator, a
-   * processing reaction, etc.).
+   * Override to perform cleanup (e.g. remove a "typing" indicator).
    */
-  protected onAfterTurnEnd(_channelId: string): Promise<void> {
+  protected onAfterTurnEnd(_chatId: string): Promise<void> {
     return Promise.resolve();
   }
 
   /**
-   * Called after a turn error, once state has been cleaned up.
-   * Override to send an error message to the user.
+   * Called after a turn error. Default sends an error message via sendText.
+   * Override for platform-specific error rendering (e.g. error card).
    */
-  protected onAfterTurnError(_channelId: string, _error: string): Promise<void> {
-    return Promise.resolve();
-  }
-
-  /**
-   * Map an ACP `sessionId` to the channel ID used internally.
-   *
-   * Default: identity (sessionId === channelId).
-   *
-   * Override if your plugin namespaces channel IDs (e.g. Feishu uses
-   * `"feishu:<sessionId>"`, WeChat uses `"weixin-openclaw-bridge:<sessionId>"`).
-   */
-  protected sessionIdToChannelId(sessionId: string): string {
-    return sessionId;
+  protected async onAfterTurnError(chatId: string, error: string): Promise<void> {
+    await this.sendText(chatId, `❌ Error: ${error}`);
   }
 
   // ---------------------------------------------------------------------------
@@ -247,11 +248,9 @@ export abstract class BlockRenderer<TRef = string> {
    * Call this from the ACP `Client.sessionUpdate` handler.
    */
   onSessionUpdate(notification: SessionNotification): void {
-    const sessionId = notification.sessionId;
-    // Narrow through the local ConsumedSessionUpdate union — see the type
-    // declaration above this class for why we re-declare it locally instead
-    // of importing the SDK's own union. Variants other than the four we
-    // handle are treated as no-ops.
+    // sessionId from ACP = chatId (the host replaces the real agent session
+    // ID with the chat ID before forwarding to the plugin).
+    const chatId = notification.sessionId;
     const rawUpdate = notification.update as unknown as { sessionUpdate: string };
     const variant = rawUpdate.sessionUpdate;
     if (
@@ -263,52 +262,68 @@ export abstract class BlockRenderer<TRef = string> {
       return;
     }
     const update = rawUpdate as ConsumedSessionUpdate;
-    const channelId = this.sessionIdToChannelId(sessionId);
 
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         const delta = update.content?.text ?? "";
-        if (delta) this.appendToBlock(channelId, "text", delta);
+        if (delta) this.appendToBlock(chatId, "text", delta);
         break;
       }
       case "agent_thought_chunk": {
-        if (!this.verbose.showThinking) return; // skip — no block, no boundary
+        if (!this.verbose.showThinking) return;
         const delta = update.content?.text ?? "";
-        if (delta) this.appendToBlock(channelId, "thinking", delta);
+        if (delta) this.appendToBlock(chatId, "thinking", delta);
         break;
       }
       case "tool_call": {
-        if (!this.verbose.showToolUse) return; // skip
-        if (update.title) this.appendToBlock(channelId, "tool", `🔧 ${update.title}\n`);
+        if (!this.verbose.showToolUse) return;
+        if (update.title) this.appendToBlock(chatId, "tool", `🔧 ${update.title}\n`);
         break;
       }
       case "tool_call_update": {
-        if (!this.verbose.showToolUse) return; // skip
+        if (!this.verbose.showToolUse) return;
         const title = update.title ?? "tool";
         if (update.status === "completed" || update.status === "error") {
-          this.appendToBlock(channelId, "tool", `✅ ${title}\n`);
+          this.appendToBlock(chatId, "tool", `✅ ${title}\n`);
         }
         break;
       }
-      // Unknown / unconsumed variant — ignore.
     }
   }
 
   /**
-   * Call this before sending a prompt to the agent.
-   *
-   * Clears any leftover state from a previous turn so the new turn starts
-   * with a clean slate.
+   * Call before sending a prompt. Tracks the active chatId and clears
+   * leftover state from a previous turn.
    */
-  onPromptSent(channelId: string): void {
-    const old = this.states.get(channelId);
+  onPromptSent(chatId: string): void {
+    this.lastActiveChatId = chatId;
+    const old = this.states.get(chatId);
     if (old?.flushTimer) clearTimeout(old.flushTimer);
-    this.states.set(channelId, {
+    this.states.set(chatId, {
       blocks: [],
       flushTimer: null,
       lastEditMs: 0,
       sendChain: Promise.resolve(),
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Host notification handlers — built-in defaults, no per-plugin duplication
+  // ---------------------------------------------------------------------------
+
+  /** Handle `channel/system_text` from host. */
+  onSystemText(chatId: string, text: string): void {
+    this.sendText(chatId, text).catch(() => {});
+  }
+
+  /** Handle `channel/agent_ready` from host. */
+  onAgentReady(chatId: string, agent: string, version: string): void {
+    this.sendText(chatId, `🤖 Agent: ${agent} v${version}`).catch(() => {});
+  }
+
+  /** Handle `channel/session_ready` from host. */
+  onSessionReady(chatId: string, sessionId: string): void {
+    this.sendText(chatId, `📋 Session: ${sessionId}`).catch(() => {});
   }
 
   /**
@@ -317,8 +332,8 @@ export abstract class BlockRenderer<TRef = string> {
    * Seals and flushes the last block, then waits for all pending sends/edits
    * to complete before calling `onAfterTurnEnd`.
    */
-  async onTurnEnd(channelId: string): Promise<void> {
-    const state = this.states.get(channelId);
+  async onTurnEnd(chatId: string): Promise<void> {
+    const state = this.states.get(chatId);
     if (!state) return;
 
     if (state.flushTimer) {
@@ -332,35 +347,33 @@ export abstract class BlockRenderer<TRef = string> {
       this.enqueueFlush(state, last);
     }
 
-    // Wait for the entire chain to drain before cleanup
     await state.sendChain;
-    this.states.delete(channelId);
-    await this.onAfterTurnEnd(channelId);
+    this.states.delete(chatId);
+    await this.onAfterTurnEnd(chatId);
   }
 
   /**
    * Call this when `agent.prompt()` throws (turn error).
    *
-   * Discards pending state and calls `onAfterTurnError` so the subclass can
-   * send an error message to the user.
+   * Discards pending state and calls `onAfterTurnError`.
    */
-  async onTurnError(channelId: string, error: string): Promise<void> {
-    const state = this.states.get(channelId);
+  async onTurnError(chatId: string, error: string): Promise<void> {
+    const state = this.states.get(chatId);
     if (state?.flushTimer) clearTimeout(state.flushTimer);
-    this.states.delete(channelId);
-    await this.onAfterTurnError(channelId, error);
+    this.states.delete(chatId);
+    await this.onAfterTurnError(chatId, error);
   }
 
   // ---------------------------------------------------------------------------
   // Internal — block management
   // ---------------------------------------------------------------------------
 
-  private appendToBlock(channelId: string, kind: BlockKind, delta: string): void {
-    let state = this.states.get(channelId);
+  private appendToBlock(chatId: string, kind: BlockKind, delta: string): void {
+    let state = this.states.get(chatId);
     if (!state) {
       // Auto-create state if onPromptSent wasn't called (e.g. host-initiated turns)
       state = { blocks: [], flushTimer: null, lastEditMs: 0, sendChain: Promise.resolve() };
-      this.states.set(channelId, state);
+      this.states.set(chatId, state);
     }
 
     const last = state.blocks.at(-1);
@@ -379,22 +392,22 @@ export abstract class BlockRenderer<TRef = string> {
         }
         this.enqueueFlush(state, last);
       }
-      state.blocks.push({ channelId, kind, content: delta, ref: null, creating: false, sealed: false });
+      state.blocks.push({ chatId, kind, content: delta, ref: null, creating: false, sealed: false });
     }
 
-    this.scheduleFlush(channelId, state);
+    this.scheduleFlush(chatId, state);
   }
 
-  private scheduleFlush(channelId: string, state: ChannelState<TRef>): void {
+  private scheduleFlush(chatId: string, state: ChannelState<TRef>): void {
     if (state.flushTimer) return; // already scheduled
 
     state.flushTimer = setTimeout(() => {
       state.flushTimer = null;
-      this.flush(channelId, state);
+      this.flush(chatId, state);
     }, this.flushIntervalMs);
   }
 
-  private flush(channelId: string, state: ChannelState<TRef>): void {
+  private flush(chatId: string, state: ChannelState<TRef>): void {
     const block = state.blocks.at(-1);
     if (!block || block.sealed || !block.content) return;
 
@@ -416,7 +429,7 @@ export abstract class BlockRenderer<TRef = string> {
       if (!state.flushTimer) {
         state.flushTimer = setTimeout(() => {
           state.flushTimer = null;
-          this.flush(channelId, state);
+          this.flush(chatId, state);
         }, delay);
       }
       return;
@@ -439,12 +452,12 @@ export abstract class BlockRenderer<TRef = string> {
       if (block.ref === null && !block.creating) {
         // First send — use sentinel to prevent concurrent creates
         block.creating = true;
-        block.ref = await this.sendBlock(block.channelId, block.kind, content);
+        block.ref = await this.sendBlock(block.chatId, block.kind, content);
         block.creating = false;
         state.lastEditMs = Date.now();
       } else if (block.ref !== null && !block.creating && this.editBlock) {
         // Subsequent update — edit in-place
-        await this.editBlock(block.channelId, block.ref, block.kind, content, block.sealed);
+        await this.editBlock(block.chatId, block.ref, block.kind, content, block.sealed);
         state.lastEditMs = Date.now();
       }
       // else: create is in-flight (creating === true) — skip

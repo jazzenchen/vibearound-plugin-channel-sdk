@@ -63,9 +63,9 @@ export { extractErrorMessage } from "./errors.js";
 // Plugin runner (absorbs the main.ts boilerplate)
 export { runChannelPlugin } from "./run-plugin.js";
 export type {
+  BotIdentity,
   ChannelBot,
   ChannelPluginLogger,
-  ChannelStreamHandler,
   CreateBotContext,
   RunChannelPluginSpec,
   VerboseOptions,
