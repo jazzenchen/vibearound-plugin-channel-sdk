@@ -53,12 +53,7 @@ export type ChannelPluginLogger = (level: string, msg: string) => void;
 
 export interface ChannelStreamHandler {
   onSessionUpdate(params: SessionNotification): void;
-  /**
-   * Called when the host sends a `channel/system_text` notification.
-   * `channelId` is the full `channelKind:chatId` string from the host.
-   * Plugins that track `lastChannelId` internally can ignore `channelId`.
-   */
-  onSystemText(text: string, channelId?: string): void;
+  onSystemText(text: string): void;
   onAgentReady(agent: string, version: string): void;
   onSessionReady(sessionId: string): void;
 }
@@ -185,8 +180,7 @@ async function runInner<
         switch (normalizeExtMethod(method)) {
           case "channel/system_text": {
             const text = params.text as string;
-            const channelId = params.channelId as string | undefined;
-            streamHandler?.onSystemText(text, channelId);
+            streamHandler?.onSystemText(text);
             break;
           }
           case "channel/agent_ready": {
