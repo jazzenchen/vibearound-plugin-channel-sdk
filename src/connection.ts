@@ -111,16 +111,6 @@ export async function connectToHost(
 // ---------------------------------------------------------------------------
 
 /**
- * Normalize ACP ext notification method names.
- *
- * The ACP SDK prepends "_" to ext method names (e.g. "_channel/system_text").
- * Strip the prefix to get the canonical method name used in plugin.json.
- */
-export function normalizeExtMethod(method: string): string {
-  return method.startsWith("_") ? method.slice(1) : method;
-}
-
-/**
  * Redirect all console.* output to stderr.
  *
  * ACP uses stdout for JSON-RPC framing — any stray console output corrupts

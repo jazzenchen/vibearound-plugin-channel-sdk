@@ -33,7 +33,7 @@
  * import from the `advanced` subpath:
  *
  * ```ts
- * import { connectToHost, normalizeExtMethod } from "@vibearound/plugin-channel-sdk/advanced";
+ * import { connectToHost } from "@vibearound/plugin-channel-sdk/advanced";
  * ```
  */
 
@@ -49,7 +49,6 @@ export { BlockRenderer } from "./renderer.js";
 
 // Interfaces the plugin implements
 export type {
-  BotIdentity,
   ChannelBot,
   ChannelPluginLogger,
   CreateBotContext,

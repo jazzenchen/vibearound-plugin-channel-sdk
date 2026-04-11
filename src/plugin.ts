@@ -26,7 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Agent } from "@agentclientprotocol/sdk";
 
-import { connectToHost, normalizeExtMethod } from "./connection.js";
+import { connectToHost } from "./connection.js";
 import { extractErrorMessage } from "./errors.js";
 import { BlockRenderer } from "./renderer.js";
 import type {
@@ -41,12 +41,6 @@ import type {
 
 export type ChannelPluginLogger = (level: string, msg: string) => void;
 
-/** Bot identity on the IM platform. */
-export interface BotIdentity {
-  id: string;
-  name: string;
-}
-
 /**
  * The platform bot — handles IM connectivity and message transport.
  *
@@ -54,8 +48,6 @@ export interface BotIdentity {
  * methods during the plugin lifecycle.
  */
 export interface ChannelBot<TRenderer extends BlockRenderer = BlockRenderer> {
-  /** Return the bot's IM identity. Called after start(). */
-  getBotIdentity(): BotIdentity;
   /** Wire the renderer to receive streaming events. */
   setStreamHandler(handler: TRenderer): void;
   /** Connect to the IM platform and start receiving messages. */
@@ -171,7 +163,7 @@ async function runInner<
         params: Record<string, unknown>,
       ): Promise<void> {
         const chatId = params.chatId as string | undefined;
-        switch (normalizeExtMethod(method)) {
+        switch (method) {
           case "channel/system_text": {
             if (chatId && renderer) {
               renderer.onSystemText(chatId, params.text as string);
@@ -237,22 +229,6 @@ async function runInner<
 
   await bot.start();
   log("info", "plugin started");
-
-  // Report bot identity to host
-  const identity = bot.getBotIdentity();
-  log("info", `bot identity: ${identity.name} (${identity.id})`);
-  // Send via ACP ext_notification to host
-  try {
-    await (agent as unknown as {
-      extNotification(method: string, params: Record<string, unknown>): Promise<void>;
-    }).extNotification("channel/bot_identity", {
-      botId: identity.id,
-      botName: identity.name,
-    });
-  } catch {
-    // Non-fatal — host may not support this notification yet
-    log("debug", "bot_identity notification not acknowledged (host may be older version)");
-  }
 
   await conn.closed;
   log("info", "connection closed, shutting down");

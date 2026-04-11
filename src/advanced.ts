@@ -11,7 +11,7 @@
  */
 
 // Low-level ACP connection
-export { connectToHost, normalizeExtMethod, redirectConsoleToStderr } from "./connection.js";
+export { connectToHost, redirectConsoleToStderr } from "./connection.js";
 export type { PluginInfo, ConnectResult, AgentInfo } from "./connection.js";
 
 // All types (including internal ones)
@@ -35,7 +35,6 @@ export { runChannelPlugin } from "./plugin.js";
 export { BlockRenderer } from "./renderer.js";
 export { extractErrorMessage } from "./errors.js";
 export type {
-  BotIdentity,
   ChannelBot,
   ChannelPluginLogger,
   CreateBotContext,
