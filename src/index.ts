@@ -1,67 +1,53 @@
 /**
  * @vibearound/plugin-channel-sdk
  *
- * Base classes and utilities for building VibeAround channel plugins.
+ * SDK for building VibeAround channel plugins.
  *
  * ## Quick start
  *
  * ```ts
  * import {
- *   connectToHost,
+ *   runChannelPlugin,
  *   BlockRenderer,
- *   normalizeExtMethod,
- *   type Agent,
- *   type SessionNotification,
+ *   type ChannelBot,
+ *   type BlockKind,
  * } from "@vibearound/plugin-channel-sdk";
  *
  * class MyRenderer extends BlockRenderer<string> {
- *   protected async sendBlock(channelId, kind, content) {
- *     const msg = await myPlatform.send(channelId, content);
- *     return msg.id;
- *   }
- *   protected async editBlock(channelId, ref, kind, content, sealed) {
- *     await myPlatform.edit(ref, content);
- *   }
+ *   protected async sendText(chatId: string, text: string) { ... }
+ *   protected async sendBlock(chatId: string, kind: BlockKind, content: string) { ... }
  * }
  *
- * let agent!: Agent;
- * const renderer = new MyRenderer();
+ * runChannelPlugin({
+ *   name: "vibearound-mybot",
+ *   version: "0.1.0",
+ *   requiredConfig: ["bot_token"],
+ *   createBot: ({ config, agent, log, cacheDir }) => new MyBot(...),
+ *   createRenderer: (bot, log, verbose) => new MyRenderer(bot, log, verbose),
+ * });
+ * ```
  *
- * const { meta, conn } = await connectToHost(
- *   { name: "vibearound-mybot", version: "0.1.0" },
- *   (a) => {
- *     agent = a;
- *     return {
- *       sessionUpdate: async (n) => renderer.onSessionUpdate(n),
- *       requestPermission: async (p) => ({
- *         outcome: { outcome: "selected", optionId: p.options![0].optionId },
- *       }),
- *       extNotification: async (method, params) => {
- *         switch (normalizeExtMethod(method)) {
- *           case "channel/system_text":
- *             await myPlatform.send(params.channelId as string, params.text as string);
- *             break;
- *         }
- *       },
- *     };
- *   },
- * );
+ * ## Advanced / low-level usage
  *
- * const botToken = meta.config.bot_token as string;
- * // … start your platform bot …
- * await conn.closed;
+ * For plugins that need custom ACP lifecycle control (e.g. weixin-openclaw-bridge),
+ * import from the `advanced` subpath:
+ *
+ * ```ts
+ * import { connectToHost, normalizeExtMethod } from "@vibearound/plugin-channel-sdk/advanced";
  * ```
  */
 
-// Connection helpers
-export { connectToHost, normalizeExtMethod, redirectConsoleToStderr } from "./connection.js";
-export type { PluginInfo, ConnectResult, AgentInfo } from "./connection.js";
+// ---------------------------------------------------------------------------
+// High-level API — what plugin developers use
+// ---------------------------------------------------------------------------
 
-// Error normalization
-export { extractErrorMessage } from "./errors.js";
+// Entry point
+export { runChannelPlugin } from "./plugin.js";
 
-// Plugin runner (absorbs the main.ts boilerplate)
-export { runChannelPlugin } from "./run-plugin.js";
+// Base class for stream rendering
+export { BlockRenderer } from "./renderer.js";
+
+// Interfaces the plugin implements
 export type {
   BotIdentity,
   ChannelBot,
@@ -69,26 +55,21 @@ export type {
   CreateBotContext,
   RunChannelPluginSpec,
   VerboseOptions,
-} from "./run-plugin.js";
+} from "./plugin.js";
 
-// Block renderer
-export { BlockRenderer } from "./renderer.js";
-
-
-// Types (re-exports ACP SDK types + SDK-specific types)
+// Types used in BlockRenderer overrides
 export type {
-  // ACP SDK
-  Agent,
-  Client,
-  ContentBlock,
-  SessionNotification,
-  RequestPermissionRequest,
-  RequestPermissionResponse,
-  // SDK
   BlockKind,
   VerboseConfig,
   BlockRendererOptions,
-  PluginCapabilities,
-  PluginManifest,
-  PluginInitMeta,
 } from "./types.js";
+
+// ACP types the plugin needs for prompt content
+export type {
+  Agent,
+  ContentBlock,
+  SessionNotification,
+} from "./types.js";
+
+// Error utility
+export { extractErrorMessage } from "./errors.js";

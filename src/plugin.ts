@@ -111,22 +111,6 @@ export interface RunChannelPluginSpec<
 }
 
 // ---------------------------------------------------------------------------
-// Backward compat — old createStreamHandler maps to createRenderer
-// ---------------------------------------------------------------------------
-
-/** @deprecated Use `createRenderer` instead. */
-export interface RunChannelPluginSpecLegacy<
-  TBot extends ChannelBot<TRenderer>,
-  TRenderer extends BlockRenderer,
-> extends Omit<RunChannelPluginSpec<TBot, TRenderer>, "createRenderer"> {
-  createStreamHandler: (
-    bot: TBot,
-    log: ChannelPluginLogger,
-    verbose: VerboseOptions,
-  ) => TRenderer;
-}
-
-// ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
@@ -140,9 +124,7 @@ export interface RunChannelPluginSpecLegacy<
 export async function runChannelPlugin<
   TBot extends ChannelBot<TRenderer>,
   TRenderer extends BlockRenderer,
->(
-  spec: RunChannelPluginSpec<TBot, TRenderer> | RunChannelPluginSpecLegacy<TBot, TRenderer>,
-): Promise<void> {
+>(spec: RunChannelPluginSpec<TBot, TRenderer>): Promise<void> {
   const prefix = `[${spec.name.replace(/^vibearound-/, "")}-plugin]`;
   const log: ChannelPluginLogger = (level, msg) => {
     process.stderr.write(`${prefix}[${level}] ${msg}\n`);
@@ -160,7 +142,7 @@ async function runInner<
   TBot extends ChannelBot<TRenderer>,
   TRenderer extends BlockRenderer,
 >(
-  spec: RunChannelPluginSpec<TBot, TRenderer> | RunChannelPluginSpecLegacy<TBot, TRenderer>,
+  spec: RunChannelPluginSpec<TBot, TRenderer>,
   log: ChannelPluginLogger,
 ): Promise<void> {
   log("info", "initializing ACP connection...");
@@ -250,9 +232,7 @@ async function runInner<
     showToolUse: verboseRaw?.show_tool_use ?? false,
   };
 
-  // Resolve renderer factory — support both new `createRenderer` and legacy `createStreamHandler`
-  const createFn = "createRenderer" in spec ? spec.createRenderer : spec.createStreamHandler;
-  renderer = createFn(bot, log, verbose);
+  renderer = spec.createRenderer(bot, log, verbose);
   bot.setStreamHandler(renderer);
 
   await bot.start();

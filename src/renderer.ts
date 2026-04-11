@@ -139,6 +139,8 @@ const DEFAULT_MIN_EDIT_INTERVAL_MS = 1000;
  *   return type of `sendBlock` and the first argument of `editBlock`.
  */
 export abstract class BlockRenderer<TRef = string> {
+  /** Whether the IM supports editing messages (streaming mode). */
+  protected readonly streaming: boolean;
   protected readonly flushIntervalMs: number;
   protected readonly minEditIntervalMs: number;
   protected readonly verbose: VerboseConfig;
@@ -150,6 +152,7 @@ export abstract class BlockRenderer<TRef = string> {
   private lastActiveChatId: string | null = null;
 
   constructor(options: BlockRendererOptions = {}) {
+    this.streaming = options.streaming ?? true;
     this.flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
     this.minEditIntervalMs = options.minEditIntervalMs ?? DEFAULT_MIN_EDIT_INTERVAL_MS;
     this.verbose = {
@@ -411,14 +414,11 @@ export abstract class BlockRenderer<TRef = string> {
     const block = state.blocks.at(-1);
     if (!block || block.sealed || !block.content) return;
 
-    // Send-only mode: subclasses that don't override `editBlock` (e.g.
-    // QQ Bot, where the platform has no edit support) would otherwise
-    // POST a new message for every debounced flush, so the user sees a
-    // partial chunk followed by the full message as two separate
-    // deliveries. Defer intermediate sends; only `onTurnEnd` and block
-    // boundary transitions inside `appendToBlock` (which seal the block
-    // first) will actually POST.
-    if (!this.editBlock) {
+    // Send-only mode (streaming=false): defer intermediate sends.
+    // Only sealed blocks (from onTurnEnd or block boundary transitions)
+    // will actually POST. This prevents the user seeing a partial chunk
+    // followed by the full message as two separate messages.
+    if (!this.streaming) {
       return;
     }
 
@@ -455,8 +455,8 @@ export abstract class BlockRenderer<TRef = string> {
         block.ref = await this.sendBlock(block.chatId, block.kind, content);
         block.creating = false;
         state.lastEditMs = Date.now();
-      } else if (block.ref !== null && !block.creating && this.editBlock) {
-        // Subsequent update — edit in-place
+      } else if (block.ref !== null && !block.creating && this.streaming && this.editBlock) {
+        // Subsequent update — edit in-place (streaming mode only)
         await this.editBlock(block.chatId, block.ref, block.kind, content, block.sealed);
         state.lastEditMs = Date.now();
       }

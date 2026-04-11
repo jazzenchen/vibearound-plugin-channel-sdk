@@ -59,6 +59,18 @@ export interface VerboseConfig {
 
 export interface BlockRendererOptions {
   /**
+   * Whether the IM platform supports message editing (streaming mode).
+   *
+   * - `true` (default): blocks stream in real-time — `sendBlock()` creates
+   *   the message, `editBlock()` updates it as more content arrives.
+   * - `false`: each block is held until complete, then sent once via
+   *   `sendBlock()`. `editBlock()` is never called.
+   *
+   * Set to `false` for platforms that don't support editing sent messages
+   * (e.g. QQ Bot, WhatsApp, WeChat, LINE).
+   */
+  streaming?: boolean;
+  /**
    * Debounce interval before flushing an unsealed block (ms).
    * Controls how often in-progress blocks are sent to the platform.
    * Default: 500.
