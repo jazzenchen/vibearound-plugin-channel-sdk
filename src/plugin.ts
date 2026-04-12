@@ -2,8 +2,8 @@
  * runChannelPlugin — the SDK entry point for every channel plugin.
  *
  * Handles the full ACP lifecycle: connect to host, validate config, create
- * bot + renderer, start, stream, shutdown. The plugin only implements
- * platform-specific transport (sendText, sendBlock, editBlock).
+ * bot + renderer, start the bot, then await disconnect and stop. The plugin
+ * only implements platform-specific transport (sendText, sendBlock, editBlock).
  *
  * ## Usage
  *
@@ -26,7 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Agent } from "@agentclientprotocol/sdk";
 
-import { connectToHost } from "./connection.js";
+import { connectToHost, stripExtPrefix } from "./connection.js";
 import { extractErrorMessage } from "./errors.js";
 import { BlockRenderer } from "./renderer.js";
 import type {
@@ -47,7 +47,8 @@ export type ChannelPluginLogger = (level: string, msg: string) => void;
  * Plugins implement this interface on their bot class. The SDK calls these
  * methods during the plugin lifecycle.
  */
-export interface ChannelBot<TRenderer extends BlockRenderer = BlockRenderer> {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export interface ChannelBot<TRenderer extends BlockRenderer<any> = BlockRenderer<any>> {
   /** Wire the renderer to receive streaming events. */
   setStreamHandler(handler: TRenderer): void;
   /** Connect to the IM platform and start receiving messages. */
@@ -70,7 +71,7 @@ export interface VerboseOptions {
 
 export interface RunChannelPluginSpec<
   TBot extends ChannelBot<TRenderer>,
-  TRenderer extends BlockRenderer,
+  TRenderer extends BlockRenderer<any>,
 > {
   /** Plugin name reported during ACP initialize (e.g. "vibearound-slack"). */
   name: string;
@@ -107,15 +108,15 @@ export interface RunChannelPluginSpec<
 // ---------------------------------------------------------------------------
 
 /**
- * Run a channel plugin to completion.
+ * Run a channel plugin.
  *
- * Performs the ACP initialize handshake, validates config, constructs the
- * bot + renderer, reports bot identity, starts the bot, waits for the host
- * to disconnect, then stops the bot and exits.
+ * Handles the full ACP lifecycle: connect to host, validate config,
+ * construct bot + renderer, start the bot, then wait for the host
+ * to disconnect before stopping and exiting.
  */
 export async function runChannelPlugin<
   TBot extends ChannelBot<TRenderer>,
-  TRenderer extends BlockRenderer,
+  TRenderer extends BlockRenderer<any>,
 >(spec: RunChannelPluginSpec<TBot, TRenderer>): Promise<void> {
   const prefix = `[${spec.name.replace(/^vibearound-/, "")}-plugin]`;
   const log: ChannelPluginLogger = (level, msg) => {
@@ -132,7 +133,7 @@ export async function runChannelPlugin<
 
 async function runInner<
   TBot extends ChannelBot<TRenderer>,
-  TRenderer extends BlockRenderer,
+  TRenderer extends BlockRenderer<any>,
 >(
   spec: RunChannelPluginSpec<TBot, TRenderer>,
   log: ChannelPluginLogger,
@@ -162,28 +163,37 @@ async function runInner<
         method: string,
         params: Record<string, unknown>,
       ): Promise<void> {
-        const chatId = params.chatId as string | undefined;
-        switch (method) {
-          case "channel/system_text": {
+        const chatId = typeof params.chatId === "string" ? params.chatId : undefined;
+        switch (stripExtPrefix(method)) {
+          case "va/system_text": {
+            const text = typeof params.text === "string" ? params.text : "";
             if (chatId && renderer) {
-              renderer.onSystemText(chatId, params.text as string);
+              renderer.onSystemText(chatId, text);
             }
             break;
           }
-          case "channel/agent_ready": {
-            const agentName = params.agent as string;
-            const version = params.version as string;
+          case "va/agent_ready": {
+            const agentName = typeof params.agent === "string" ? params.agent : "unknown";
+            const version = typeof params.version === "string" ? params.version : "";
             log("info", `agent_ready: ${agentName} v${version}`);
             if (chatId && renderer) {
               renderer.onAgentReady(chatId, agentName, version);
             }
             break;
           }
-          case "channel/session_ready": {
-            const sessionId = params.sessionId as string;
+          case "va/session_ready": {
+            const sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
             log("info", `session_ready: ${sessionId}`);
             if (chatId && renderer) {
               renderer.onSessionReady(chatId, sessionId);
+            }
+            break;
+          }
+          case "va/command_menu": {
+            const systemCommands = Array.isArray(params.systemCommands) ? params.systemCommands : [];
+            const agentCommands = Array.isArray(params.agentCommands) ? params.agentCommands : [];
+            if (chatId && renderer) {
+              renderer.onCommandMenu(chatId, systemCommands, agentCommands);
             }
             break;
           }

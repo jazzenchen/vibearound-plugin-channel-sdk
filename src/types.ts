@@ -47,6 +47,22 @@ export interface PluginManifest {
 // Block rendering
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Command menu
+// ---------------------------------------------------------------------------
+
+/** A command entry from the host's command list. */
+export interface CommandEntry {
+  name: string;
+  description: string;
+  args?: string;
+  aliases?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Block rendering
+// ---------------------------------------------------------------------------
+
 /** The three kinds of content blocks a plugin renders. */
 export type BlockKind = "text" | "thinking" | "tool";
 

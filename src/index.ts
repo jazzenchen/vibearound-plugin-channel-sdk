@@ -59,6 +59,7 @@ export type {
 // Types used in BlockRenderer overrides
 export type {
   BlockKind,
+  CommandEntry,
   VerboseConfig,
   BlockRendererOptions,
 } from "./types.js";

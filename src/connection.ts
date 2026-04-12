@@ -111,6 +111,22 @@ export async function connectToHost(
 // ---------------------------------------------------------------------------
 
 /**
+ * Strip the `_` prefix from ACP extension method names.
+ *
+ * The Rust ACP SDK adds `_` when sending ext notifications on the wire,
+ * but the TypeScript ACP SDK does not strip it on receipt. This function
+ * normalizes the received method name so handlers can match the canonical
+ * name (e.g. `_va/system_text` → `va/system_text`).
+ *
+ * Note: when sending ext notifications FROM TypeScript TO the Rust host,
+ * the method name must include the `_` prefix manually (e.g. `_va/callback`)
+ * because the TypeScript SDK does not add it automatically.
+ */
+export function stripExtPrefix(method: string): string {
+  return method.startsWith("_") ? method.slice(1) : method;
+}
+
+/**
  * Redirect all console.* output to stderr.
  *
  * ACP uses stdout for JSON-RPC framing — any stray console output corrupts

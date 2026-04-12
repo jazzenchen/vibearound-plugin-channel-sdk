@@ -11,7 +11,7 @@
  */
 
 // Low-level ACP connection
-export { connectToHost, redirectConsoleToStderr } from "./connection.js";
+export { connectToHost, stripExtPrefix, redirectConsoleToStderr } from "./connection.js";
 export type { PluginInfo, ConnectResult, AgentInfo } from "./connection.js";
 
 // All types (including internal ones)

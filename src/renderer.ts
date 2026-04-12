@@ -25,8 +25,13 @@
  *
  * ## Usage
  *
+ * Subclass and implement `sendText` + `sendBlock` (+ optionally `editBlock`):
+ *
  * ```ts
  * class MyRenderer extends BlockRenderer<string> {
+ *   protected async sendText(chatId, text) {
+ *     await myApi.sendMessage(chatId, text);
+ *   }
  *   protected async sendBlock(chatId, kind, content) {
  *     const msg = await myApi.sendMessage(chatId, content);
  *     return msg.id;
@@ -35,26 +40,15 @@
  *     await myApi.editMessage(ref, content);
  *   }
  * }
- *
- * // In main.ts:
- * const renderer = new MyRenderer({ verbose: { showThinking: false } });
- *
- * // When user sends a message:
- * renderer.onPromptSent(chatId);
- * try {
- *   await agent.prompt({ sessionId, content });
- *   await renderer.onTurnEnd(chatId);
- * } catch (e) {
- *   await renderer.onTurnError(chatId, String(e));
- * }
- *
- * // In the ACP client's sessionUpdate handler:
- * renderer.onSessionUpdate(notification);
  * ```
+ *
+ * The SDK's `runChannelPlugin` wires all ACP events to this renderer
+ * automatically — plugins don't call onSessionUpdate/onPromptSent/etc
+ * directly.
  */
 
 import type { SessionNotification } from "@agentclientprotocol/sdk";
-import type { BlockKind, BlockRendererOptions, VerboseConfig } from "./types.js";
+import type { BlockKind, BlockRendererOptions, CommandEntry, VerboseConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Local ACP session-update narrowing
@@ -139,7 +133,8 @@ const DEFAULT_MIN_EDIT_INTERVAL_MS = 1000;
  *   return type of `sendBlock` and the first argument of `editBlock`.
  */
 export abstract class BlockRenderer<TRef = string> {
-  /** Whether the IM supports editing messages (streaming mode). */
+  /** When true, blocks are sent and edited in real-time. When false, each
+   *  block is held until complete, then sent once (send-only mode). */
   protected readonly streaming: boolean;
   protected readonly flushIntervalMs: number;
   protected readonly minEditIntervalMs: number;
@@ -248,7 +243,7 @@ export abstract class BlockRenderer<TRef = string> {
    * Routes the event to the correct block based on its variant, appending
    * deltas to the current block or starting a new one when the kind changes.
    *
-   * Call this from the ACP `Client.sessionUpdate` handler.
+   * Called automatically by `runChannelPlugin` — plugins don't call this directly.
    */
   onSessionUpdate(notification: SessionNotification): void {
     // sessionId from ACP = chatId (the host replaces the real agent session
@@ -314,19 +309,56 @@ export abstract class BlockRenderer<TRef = string> {
   // Host notification handlers — built-in defaults, no per-plugin duplication
   // ---------------------------------------------------------------------------
 
-  /** Handle `channel/system_text` from host. */
+  /** Handle `va/system_text` from host. */
   onSystemText(chatId: string, text: string): void {
     this.sendText(chatId, text).catch(() => {});
   }
 
-  /** Handle `channel/agent_ready` from host. */
+  /** Handle `va/agent_ready` from host. */
   onAgentReady(chatId: string, agent: string, version: string): void {
     this.sendText(chatId, `🤖 Agent: ${agent} v${version}`).catch(() => {});
   }
 
-  /** Handle `channel/session_ready` from host. */
+  /** Handle `va/session_ready` from host. */
   onSessionReady(chatId: string, sessionId: string): void {
     this.sendText(chatId, `📋 Session: ${sessionId}`).catch(() => {});
+  }
+
+  /**
+   * Handle `va/command_menu` from host — display available commands.
+   *
+   * Default renders a plain-text list. Override for platform-specific
+   * rendering (e.g. Feishu interactive card, Slack Block Kit, Telegram
+   * inline keyboard).
+   */
+  onCommandMenu(
+    chatId: string,
+    systemCommands: CommandEntry[],
+    agentCommands: CommandEntry[],
+  ): void {
+    const lines: string[] = [];
+
+    lines.push("System commands:");
+    for (const cmd of systemCommands) {
+      const usage = cmd.args ? `/${cmd.name} ${cmd.args}` : `/${cmd.name}`;
+      lines.push(`  ${usage} — ${cmd.description}`);
+    }
+
+    if (agentCommands.length > 0) {
+      lines.push("");
+      lines.push("Agent commands (use /agent <command>):");
+      for (const cmd of agentCommands) {
+        const desc = cmd.description.length > 80
+          ? `${cmd.description.slice(0, 77)}...`
+          : cmd.description;
+        lines.push(`  /${cmd.name} — ${desc}`);
+      }
+    } else {
+      lines.push("");
+      lines.push("Agent commands will appear after sending your first message.");
+    }
+
+    this.sendText(chatId, lines.join("\n")).catch(() => {});
   }
 
   /**
