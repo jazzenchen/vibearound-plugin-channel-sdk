@@ -1,8 +1,8 @@
 # @vibearound/plugin-channel-sdk
 
-Base classes and utilities for building [VibeAround](https://github.com/anthropics/vibearound) channel plugins.
+SDK for building [VibeAround](https://github.com/jazzenchen/VibeAround) channel plugins.
 
-VibeAround channel plugins bridge messaging platforms (Telegram, Feishu, WeChat, etc.) to the VibeAround agent runtime via the [Agent Client Protocol (ACP)](https://github.com/anthropics/agent-client-protocol). This SDK extracts the shared patterns so you can focus on platform integration.
+Channel plugins bridge IM platforms (Feishu, Telegram, Slack, Discord, etc.) to the VibeAround agent runtime via [ACP](https://agentclientprotocol.com). This SDK handles the ACP lifecycle so you only implement platform-specific message transport.
 
 ## Install
 
@@ -10,141 +10,95 @@ VibeAround channel plugins bridge messaging platforms (Telegram, Feishu, WeChat,
 npm install @vibearound/plugin-channel-sdk
 ```
 
-## What it provides
-
-- **`connectToHost()`** — Sets up the ACP stdio connection, performs the initialize handshake, extracts plugin config from the host, and redirects console output to stderr.
-- **`BlockRenderer<TRef>`** — Abstract base class that handles block-based message rendering: accumulation of streaming deltas, kind-change detection, debounced flushing, edit throttling, and ordered delivery via a serialized Promise chain.
-- **`normalizeExtMethod()`** — Strips the `_` prefix the ACP SDK adds to extension method names.
-- **Types** — Re-exports common ACP SDK types (`Agent`, `Client`, `SessionNotification`, etc.) plus SDK-specific types (`BlockKind`, `VerboseConfig`, `PluginManifest`, etc.).
-
 ## Quick start
 
 ```ts
-import {
-  connectToHost,
-  BlockRenderer,
-  normalizeExtMethod,
-  type Agent,
-  type BlockKind,
-  type SessionNotification,
-} from "@vibearound/plugin-channel-sdk";
+import { runChannelPlugin, BlockRenderer, type BlockKind, type VerboseConfig } from "@vibearound/plugin-channel-sdk";
 
 // 1. Implement a renderer for your platform
 class MyRenderer extends BlockRenderer<string> {
-  protected async sendBlock(channelId: string, kind: BlockKind, content: string) {
-    const msg = await myPlatform.send(channelId, content);
-    return msg.id; // platform message reference for future edits
+  constructor(private bot: MyBot, log: Function, verbose?: Partial<VerboseConfig>) {
+    super({ streaming: true, flushIntervalMs: 500, minEditIntervalMs: 1000, verbose });
   }
 
-  // Optional — omit for platforms that don't support editing
-  protected async editBlock(channelId: string, ref: string, kind: BlockKind, content: string, sealed: boolean) {
-    await myPlatform.edit(ref, content);
+  protected async sendText(chatId: string, text: string) {
+    await this.bot.send(chatId, text);
+  }
+
+  protected async sendBlock(chatId: string, kind: BlockKind, content: string) {
+    const msg = await this.bot.send(chatId, content);
+    return msg.id;
+  }
+
+  protected async editBlock(chatId: string, ref: string, kind: BlockKind, content: string, sealed: boolean) {
+    await this.bot.edit(chatId, ref, content);
   }
 }
 
-// 2. Connect to the VibeAround host
-const renderer = new MyRenderer({ minEditIntervalMs: 600 });
-
-const { agent, meta, agentInfo, conn } = await connectToHost(
-  { name: "vibearound-myplatform", version: "0.3.0" },
-  (_agent) => ({
-    async sessionUpdate(params: SessionNotification) {
-      renderer.onSessionUpdate(params);
-    },
-    async requestPermission(params) {
-      return { outcome: { outcome: "selected", optionId: params.options![0].optionId } };
-    },
-    async extNotification(method, params) {
-      switch (normalizeExtMethod(method)) {
-        case "channel/system_text":
-          await myPlatform.send(params.channelId as string, params.text as string);
-          break;
-      }
-    },
-  }),
-);
-
-// 3. Use the config and start your platform bot
-const botToken = meta.config.bot_token as string;
-// ... initialize your platform SDK ...
-
-// 4. On each incoming message:
-renderer.onPromptSent(channelId);
-try {
-  await agent.prompt({ sessionId: chatId, prompt: contentBlocks });
-  await renderer.onTurnEnd(channelId);
-} catch (e) {
-  await renderer.onTurnError(channelId, String(e));
-}
-
-// 5. Keep alive until host disconnects
-await conn.closed;
+// 2. Run the plugin
+runChannelPlugin({
+  name: "vibearound-myplatform",
+  version: "0.1.0",
+  requiredConfig: ["bot_token"],
+  createBot: ({ config, agent, log, cacheDir }) =>
+    new MyBot(config.bot_token as string, agent, log, cacheDir),
+  createRenderer: (bot, log, verbose) =>
+    new MyRenderer(bot, log, verbose),
+});
 ```
+
+That's it. The SDK handles ACP connection, config validation, event routing, and shutdown.
 
 ## BlockRenderer
 
-The `BlockRenderer<TRef>` groups streaming ACP events into contiguous blocks by kind (`text`, `thinking`, `tool`), then renders them to your platform via `sendBlock` / `editBlock`.
+Abstract base class that renders agent responses to your IM platform.
+
+### Required methods
+
+| Method | Description |
+|---|---|
+| `sendText(chatId, text)` | Send a plain text message (system notifications, errors) |
+| `sendBlock(chatId, kind, content)` | Send a new streaming block, return a platform ref for editing |
+
+### Optional methods
+
+| Method | Default | Description |
+|---|---|---|
+| `editBlock(chatId, ref, kind, content, sealed)` | — | Edit a message in-place (omit for send-only platforms) |
+| `formatContent(kind, content, sealed)` | Emoji prefixes | Format block content before send/edit |
+| `onAfterTurnEnd(chatId)` | No-op | Cleanup after turn completes |
+| `onAfterTurnError(chatId, error)` | `sendText(chatId, "❌ ...")` | Custom error rendering |
+| `onCommandMenu(chatId, systemCmds, agentCmds)` | Plain text list | Custom command menu rendering |
 
 ### Constructor options
 
 | Option | Default | Description |
 |---|---|---|
-| `flushIntervalMs` | `500` | Debounce interval before flushing an in-progress block |
-| `minEditIntervalMs` | `1000` | Minimum gap between consecutive edits (rate limit protection) |
-| `verbose.showThinking` | `false` | Render agent thinking/reasoning blocks |
-| `verbose.showToolUse` | `false` | Render tool call/result blocks |
+| `streaming` | `true` | `true`: send + edit in real-time. `false`: hold each block until complete, then send once |
+| `flushIntervalMs` | `500` | Debounce interval before flushing |
+| `minEditIntervalMs` | `1000` | Minimum gap between edits (rate limit protection) |
+| `verbose.showThinking` | `false` | Show agent thinking blocks |
+| `verbose.showToolUse` | `false` | Show tool call blocks |
 
-### Methods to implement
+## ChannelBot interface
 
-| Method | Required | Description |
-|---|---|---|
-| `sendBlock(channelId, kind, content)` | Yes | Send a new message, return a platform ref (or `null` if no editing) |
-| `editBlock(channelId, ref, kind, content, sealed)` | No | Edit an existing message in-place |
-| `formatContent(kind, content, sealed)` | No | Format block content before send/edit (default: emoji prefixes) |
+Your bot class should implement:
 
-### Lifecycle hooks
-
-| Hook | Description |
-|---|---|
-| `onAfterTurnEnd(channelId)` | Cleanup after all blocks are flushed (e.g. remove typing indicator) |
-| `onAfterTurnError(channelId, error)` | Send error message to user |
-| `sessionIdToChannelId(sessionId)` | Map ACP session ID to your channel ID (default: identity) |
-
-## Plugin manifest
-
-Each channel plugin needs a `plugin.json` at its root:
-
-```json
-{
-  "id": "my-platform",
-  "name": "My Platform Channel",
-  "version": "0.3.0",
-  "kind": "channel",
-  "runtime": "node",
-  "entry": "dist/main.js",
-  "build": "npm install && npm run build",
-  "configSchema": {
-    "type": "object",
-    "properties": {
-      "bot_token": { "type": "string" }
-    },
-    "required": ["bot_token"]
-  },
-  "capabilities": {
-    "streaming": true,
-    "editMessage": true,
-    "media": false
-  }
+```ts
+interface ChannelBot {
+  setStreamHandler(handler: BlockRenderer): void;
+  start(): Promise<void> | void;
+  stop(): Promise<void> | void;
 }
 ```
 
-## Examples
+## Advanced usage
 
-See the official channel plugins for real-world usage:
+For plugins that need custom ACP lifecycle control:
 
-- **Feishu** — Interactive cards, streaming updates, reactions
-- **Telegram** — Plain text messages with inline editing
-- **WeChat** — Send-only mode (no editing), typing indicators
+```ts
+import { connectToHost, stripExtPrefix } from "@vibearound/plugin-channel-sdk/advanced";
+```
 
 ## License
 
