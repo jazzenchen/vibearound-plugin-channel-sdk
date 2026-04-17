@@ -101,6 +101,20 @@ export interface RunChannelPluginSpec<
    * Optional hook invoked after bot constructed but before start().
    */
   afterCreate?: (bot: TBot, log: ChannelPluginLogger) => Promise<void> | void;
+
+  /**
+   * Optional platform connectivity probe. Called right before each 30-second
+   * heartbeat tick. Return `true` if the plugin can reach its IM platform
+   * API (for example: Slack `auth.test`, Telegram `getMe`, Feishu access
+   * token validity). Return `false` or reject → the SDK skips that
+   * heartbeat → the host's 90-second watchdog flags the channel as stuck
+   * and restarts it.
+   *
+   * Leave unset to send unconditional heartbeats. Unconditional heartbeats
+   * only catch total plugin-process freeze (rare); `healthCheck` is what
+   * catches "plugin alive but IM disconnected" (the common case).
+   */
+  healthCheck?: (bot: TBot) => Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,11 +267,54 @@ async function runInner<
   renderer = spec.createRenderer(bot, log, verbose);
   bot.setStreamHandler(renderer);
 
-  await bot.start();
+  // Start heartbeat BEFORE awaiting bot.start(). Some platform SDKs expose
+  // a blocking `start()` that only returns on shutdown (e.g. Feishu's WS
+  // gateway). Starting heartbeat first means the watchdog cadence is in
+  // place regardless of whether start() returns or runs forever.
+  const heartbeatHandle = startHeartbeat(agent, bot, spec.healthCheck, log);
+
+  // Kick bot.start() but don't let it block heartbeat shutdown on
+  // conn.closed. Capture as a Promise we `.catch()` but don't `await`;
+  // the shutdown path comes from `conn.closed`.
+  const startResult = Promise.resolve().then(() => bot.start());
+  startResult.catch((err) => log("error", `bot.start error: ${extractErrorMessage(err)}`));
   log("info", "plugin started");
 
   await conn.closed;
   log("info", "connection closed, shutting down");
+  clearInterval(heartbeatHandle);
   await bot.stop();
   process.exit(0);
+}
+
+/** Heartbeat cadence. Paired with the host's 90s watchdog — a single missed
+ *  heartbeat is tolerated, two in a row trigger restart. */
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+function startHeartbeat<TBot>(
+  agent: Agent,
+  bot: TBot,
+  healthCheck: ((bot: TBot) => Promise<boolean>) | undefined,
+  log: ChannelPluginLogger,
+): ReturnType<typeof setInterval> {
+  return setInterval(async () => {
+    try {
+      if (healthCheck) {
+        let ok = false;
+        try {
+          ok = await healthCheck(bot);
+        } catch (err) {
+          log("warn", `healthCheck threw: ${extractErrorMessage(err)}`);
+          ok = false;
+        }
+        if (!ok) {
+          log("warn", "healthCheck=false, skipping heartbeat (host will restart if sustained)");
+          return;
+        }
+      }
+      await agent.extNotification?.("_va/heartbeat", { ts: Date.now() });
+    } catch (err) {
+      log("warn", `heartbeat send failed: ${extractErrorMessage(err)}`);
+    }
+  }, HEARTBEAT_INTERVAL_MS);
 }
