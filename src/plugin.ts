@@ -152,11 +152,27 @@ async function runInner<
       async requestPermission(
         params: RequestPermissionRequest,
       ): Promise<RequestPermissionResponse> {
-        const first = params.options?.[0];
-        if (first) {
-          return { outcome: { outcome: "selected", optionId: first.optionId } };
+        const toolTitle =
+          (params.toolCall as { title?: string } | undefined)?.title ?? "?";
+        const optCount = params.options?.length ?? 0;
+        log(
+          "info",
+          `requestPermission called chat=${params.sessionId} tool="${toolTitle}" options=${optCount}`,
+        );
+        if (!renderer) {
+          return { outcome: { outcome: "cancelled" } };
         }
-        throw new Error("No permission options provided");
+        if (!params.options || params.options.length === 0) {
+          return { outcome: { outcome: "cancelled" } };
+        }
+        try {
+          const optionId = await renderer.requestPermission(params);
+          log("info", `requestPermission resolved optionId=${optionId}`);
+          return { outcome: { outcome: "selected", optionId } };
+        } catch (err) {
+          log("error", `requestPermission failed: ${extractErrorMessage(err)}`);
+          return { outcome: { outcome: "cancelled" } };
+        }
       },
 
       async extNotification(
