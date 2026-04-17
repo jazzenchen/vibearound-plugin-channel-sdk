@@ -64,11 +64,13 @@ export type {
   BlockRendererOptions,
 } from "./types.js";
 
-// ACP types the plugin needs for prompt content
+// ACP types the plugin needs for prompt content and permission overrides
 export type {
   Agent,
   ContentBlock,
   SessionNotification,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
 } from "./types.js";
 
 // Error utility

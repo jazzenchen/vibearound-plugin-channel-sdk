@@ -47,7 +47,10 @@
  * directly.
  */
 
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type {
+  RequestPermissionRequest,
+  SessionNotification,
+} from "@agentclientprotocol/sdk";
 import type { BlockKind, BlockRendererOptions, CommandEntry, VerboseConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -71,22 +74,57 @@ interface AgentThoughtChunk {
   content?: { text?: string };
 }
 
+type ToolKind =
+  | "read"
+  | "edit"
+  | "delete"
+  | "move"
+  | "search"
+  | "execute"
+  | "think"
+  | "fetch"
+  | "switch_mode"
+  | "other";
+
+type ToolStatus = "pending" | "in_progress" | "completed" | "failed";
+
+interface ToolCallContentText {
+  type?: string;
+  text?: string;
+  content?: { type?: string; text?: string };
+}
+
 interface ToolCall {
   sessionUpdate: "tool_call";
+  toolCallId: string;
   title?: string;
+  kind?: ToolKind;
+  status?: ToolStatus;
+  content?: ToolCallContentText[] | null;
+  rawOutput?: unknown;
 }
 
 interface ToolCallUpdate {
   sessionUpdate: "tool_call_update";
-  title?: string;
-  status?: string;
+  toolCallId: string;
+  title?: string | null;
+  kind?: ToolKind | null;
+  status?: ToolStatus | null;
+  content?: ToolCallContentText[] | null;
+  rawOutput?: unknown;
+}
+
+interface CurrentModeUpdate {
+  sessionUpdate: "current_mode_update";
+  currentModeId: string;
 }
 
 type ConsumedSessionUpdate =
   | AgentMessageChunk
   | AgentThoughtChunk
   | ToolCall
-  | ToolCallUpdate;
+  | ToolCallUpdate
+  | CurrentModeUpdate;
 
 // ---------------------------------------------------------------------------
 // Internal state types
@@ -105,6 +143,11 @@ interface ManagedBlock<TRef> {
   sealed: boolean;
 }
 
+interface CachedToolCall {
+  title: string;
+  kind?: ToolKind;
+}
+
 interface ChannelState<TRef> {
   blocks: ManagedBlock<TRef>[];
   flushTimer: ReturnType<typeof setTimeout> | null;
@@ -112,6 +155,9 @@ interface ChannelState<TRef> {
   lastEditMs: number;
   /** Serializes all send/edit calls — guarantees message order. */
   sendChain: Promise<void>;
+  /** Cached tool-call metadata so `tool_call_update` events (which often omit
+   *  title/kind) can render proper names and icons. Keyed by toolCallId. */
+  toolCalls: Map<string, CachedToolCall>;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +166,199 @@ interface ChannelState<TRef> {
 
 const DEFAULT_FLUSH_INTERVAL_MS = 500;
 const DEFAULT_MIN_EDIT_INTERVAL_MS = 1000;
+
+/** Max length of the one-line tool-completion summary. */
+const TOOL_SUMMARY_MAX_LEN = 80;
+
+const KIND_ICONS: Record<ToolKind, string> = {
+  read: "📖",
+  edit: "✏️",
+  delete: "🗑",
+  move: "📦",
+  search: "🔍",
+  execute: "⚡",
+  think: "💭",
+  fetch: "🌐",
+  switch_mode: "🔀",
+  other: "🔧",
+};
+
+function kindIcon(kind: ToolKind | undefined): string {
+  return kind ? (KIND_ICONS[kind] ?? "🔧") : "🔧";
+}
+
+/**
+ * Pull a single-line summary out of a tool-call completion payload.
+ * Looks at `content[0].text` first (structured), then falls back to
+ * `rawOutput` (stringified). Returns null if nothing usable.
+ */
+function extractToolSummary(
+  content: ToolCallContentText[] | null | undefined,
+  rawOutput: unknown,
+): string | null {
+  const fromContent = extractFromContent(content);
+  if (fromContent) return truncateOneLine(fromContent);
+  const fromRaw = extractFromRaw(rawOutput);
+  if (fromRaw) return truncateOneLine(fromRaw);
+  return null;
+}
+
+function extractFromContent(content: ToolCallContentText[] | null | undefined): string | null {
+  if (!content || content.length === 0) return null;
+  for (const entry of content) {
+    const direct = typeof entry?.text === "string" ? entry.text : undefined;
+    if (direct) return direct;
+    const nested = entry?.content?.text;
+    if (typeof nested === "string" && nested) return nested;
+  }
+  return null;
+}
+
+function extractFromRaw(rawOutput: unknown): string | null {
+  if (rawOutput == null) return null;
+  if (typeof rawOutput === "string") return rawOutput;
+  if (typeof rawOutput === "number" || typeof rawOutput === "boolean") {
+    return String(rawOutput);
+  }
+  if (typeof rawOutput === "object") {
+    const r = rawOutput as { output?: unknown; text?: unknown; message?: unknown };
+    for (const v of [r.output, r.text, r.message]) {
+      if (typeof v === "string" && v) return v;
+    }
+    try {
+      return JSON.stringify(rawOutput);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function truncateOneLine(s: string): string {
+  const oneLine = s.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= TOOL_SUMMARY_MAX_LEN) return oneLine;
+  return oneLine.slice(0, TOOL_SUMMARY_MAX_LEN - 1) + "…";
+}
+
+let callbackCounter = 0;
+function generateCallbackId(): string {
+  callbackCounter = (callbackCounter + 1) % 0xffffff;
+  return `p${Date.now().toString(36)}${callbackCounter.toString(36)}`;
+}
+
+/**
+ * Pick a safe fallback option when render fails: prefer reject_once so the
+ * agent cannot silently gain an unintended permission.
+ */
+function fallbackOptionId(request: RequestPermissionRequest): string | null {
+  const opts = request.options ?? [];
+  const reject = opts.find((o) => o.kind === "reject_once");
+  if (reject) return reject.optionId;
+  return opts[0]?.optionId ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Text → permission option parsing
+// ---------------------------------------------------------------------------
+
+/** Normalize a string for loose matching: lowercase, collapse whitespace,
+ *  strip separator chars so `allow_once` / `allow-once` / `allow once` all
+ *  match the same canonical form. */
+function normalizeForMatch(s: string): string {
+  return s.toLowerCase().replace(/[\s_\-]+/g, "").trim();
+}
+
+/**
+ * Map of lowercased keyword → ACP permission kind.
+ * Bilingual (EN/zh) + common single-letter / numeric shortcuts.
+ */
+const KEYWORD_TO_KIND: Record<string, string> = {
+  allow: "allow_once",
+  allowonce: "allow_once",
+  yes: "allow_once",
+  y: "allow_once",
+  ok: "allow_once",
+  confirm: "allow_once",
+  同意: "allow_once",
+  允许: "allow_once",
+  "是": "allow_once",
+  确认: "allow_once",
+  好: "allow_once",
+
+  allowalways: "allow_always",
+  always: "allow_always",
+  alwaysallow: "allow_always",
+  总是允许: "allow_always",
+  一直允许: "allow_always",
+
+  reject: "reject_once",
+  rejectonce: "reject_once",
+  deny: "reject_once",
+  no: "reject_once",
+  n: "reject_once",
+  cancel: "reject_once",
+  stop: "reject_once",
+  拒绝: "reject_once",
+  "否": "reject_once",
+  不: "reject_once",
+  取消: "reject_once",
+  算了: "reject_once",
+
+  rejectalways: "reject_always",
+  never: "reject_always",
+  alwaysreject: "reject_always",
+  alwaysdeny: "reject_always",
+  总是拒绝: "reject_always",
+  一直拒绝: "reject_always",
+};
+
+/**
+ * Try to parse a user text reply as a permission option answer.
+ *
+ * Strategy (first match wins):
+ *   1. Pure number `1..N` → `options[N-1]`
+ *   2. Keyword (case-insensitive, EN/zh) → find option with matching kind
+ *   3. Direct optionId match (case-insensitive, ignoring separators)
+ *   4. Option `name` prefix match (case-insensitive)
+ *
+ * Returns the matched `optionId`, or `null` if no match.
+ */
+export function tryParsePermissionAnswer(
+  text: string,
+  options: ReadonlyArray<{ kind: string; optionId: string; name: string }>,
+): string | null {
+  const raw = text.trim();
+  if (!raw || options.length === 0) return null;
+
+  // 1. Number
+  if (/^\d+$/.test(raw)) {
+    const n = parseInt(raw, 10);
+    if (n >= 1 && n <= options.length) return options[n - 1].optionId;
+    return null; // out-of-range number is not an implicit match
+  }
+
+  const norm = normalizeForMatch(raw);
+  if (!norm) return null;
+
+  // 2. Keyword → kind
+  const mappedKind = KEYWORD_TO_KIND[norm];
+  if (mappedKind) {
+    const opt = options.find((o) => o.kind === mappedKind);
+    if (opt) return opt.optionId;
+  }
+
+  // 3. Direct optionId match
+  for (const opt of options) {
+    if (normalizeForMatch(opt.optionId) === norm) return opt.optionId;
+  }
+
+  // 4. Name prefix/equals match
+  for (const opt of options) {
+    if (normalizeForMatch(opt.name) === norm) return opt.optionId;
+  }
+
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // BlockRenderer
@@ -145,6 +384,31 @@ export abstract class BlockRenderer<TRef = string> {
   /** The chatId of the most recent prompt. Used as fallback target for
    *  notifications that arrive without an explicit chatId. */
   private lastActiveChatId: string | null = null;
+
+  /**
+   * Pending permission requests, keyed by callback id. Resolvers are invoked
+   * by `resolvePermission` when the user clicks a button / sends a reply.
+   * Stores the full option list so we can parse text answers and find the
+   * right `reject_once` fallback on implicit cancel.
+   */
+  private pendingPermissions = new Map<
+    string,
+    {
+      resolve: (optionId: string) => void;
+      reject: (err: Error) => void;
+      chatId: string;
+      options: ReadonlyArray<{
+        kind: string;
+        optionId: string;
+        name: string;
+      }>;
+    }
+  >();
+
+  /** Index chatId → callbackId so we can locate pending by channel in O(1).
+   *  Each chat can only have one pending permission at a time (ACP semantics:
+   *  a turn is blocked while a requestPermission is in flight). */
+  private pendingByChat = new Map<string, string>();
 
   constructor(options: BlockRendererOptions = {}) {
     this.streaming = options.streaming ?? true;
@@ -255,7 +519,8 @@ export abstract class BlockRenderer<TRef = string> {
       variant !== "agent_message_chunk" &&
       variant !== "agent_thought_chunk" &&
       variant !== "tool_call" &&
-      variant !== "tool_call_update"
+      variant !== "tool_call_update" &&
+      variant !== "current_mode_update"
     ) {
       return;
     }
@@ -275,18 +540,57 @@ export abstract class BlockRenderer<TRef = string> {
       }
       case "tool_call": {
         if (!this.verbose.showToolUse) return;
-        if (update.title) this.appendToBlock(chatId, "tool", `🔧 ${update.title}\n`);
+        const state = this.ensureState(chatId);
+        const title = update.title ?? "tool";
+        const kind = update.kind ?? undefined;
+        state.toolCalls.set(update.toolCallId, { title, kind });
+        this.appendToBlock(chatId, "tool", `${kindIcon(kind)} ${title}\n`);
         break;
       }
       case "tool_call_update": {
         if (!this.verbose.showToolUse) return;
-        const title = update.title ?? "tool";
-        if (update.status === "completed" || update.status === "error") {
-          this.appendToBlock(chatId, "tool", `✅ ${title}\n`);
+        const state = this.ensureState(chatId);
+        const cached = state.toolCalls.get(update.toolCallId);
+        const title = (update.title ?? cached?.title ?? "tool");
+        const kind = (update.kind ?? cached?.kind) as ToolKind | undefined;
+        if (update.title || update.kind) {
+          state.toolCalls.set(update.toolCallId, { title, kind });
+        }
+        if (update.status === "completed" || update.status === "failed") {
+          const icon = update.status === "failed" ? "❌" : "✅";
+          const summary = extractToolSummary(update.content, update.rawOutput);
+          const line = summary
+            ? `${icon} ${title}\n   ↳ ${summary}\n`
+            : `${icon} ${title}\n`;
+          this.appendToBlock(chatId, "tool", line);
         }
         break;
       }
+      case "current_mode_update": {
+        Promise.resolve(this.onCurrentModeUpdate(chatId, update.currentModeId)).catch(() => {});
+        break;
+      }
     }
+  }
+
+  /**
+   * Called when the agent reports a session mode change (e.g. user selected
+   * "accept edits" from an ExitPlanMode permission card, or the host called
+   * `/plan` to switch to plan mode).
+   *
+   * Default implementation sends a text badge. Override to render a
+   * platform-specific card / pinned message / status indicator.
+   */
+  protected onCurrentModeUpdate(chatId: string, modeId: string): void | Promise<void> {
+    const badges: Record<string, string> = {
+      default: "🔓 Default mode",
+      plan: "📋 Plan mode — agent will analyze without making changes",
+      acceptEdits: "⏵⏵ Accept-edits mode — file edits auto-approved",
+      bypassPermissions: "⚠️ Bypass mode — all permissions auto-approved",
+      dontAsk: "🔒 Don't-ask mode — unknown tools auto-denied",
+    };
+    const text = badges[modeId] ?? `Mode: ${modeId}`;
+    this.sendText(chatId, text).catch(() => {});
   }
 
   /**
@@ -302,7 +606,28 @@ export abstract class BlockRenderer<TRef = string> {
       flushTimer: null,
       lastEditMs: 0,
       sendChain: Promise.resolve(),
+      toolCalls: new Map(),
     });
+  }
+
+  /**
+   * Get the ChannelState for a chat, creating it lazily if needed.
+   * Host-initiated notifications (e.g. tool_call without prior prompt) can
+   * land before onPromptSent is called — this keeps them working.
+   */
+  private ensureState(chatId: string): ChannelState<TRef> {
+    let state = this.states.get(chatId);
+    if (!state) {
+      state = {
+        blocks: [],
+        flushTimer: null,
+        lastEditMs: 0,
+        sendChain: Promise.resolve(),
+        toolCalls: new Map(),
+      };
+      this.states.set(chatId, state);
+    }
+    return state;
   }
 
   // ---------------------------------------------------------------------------
@@ -361,6 +686,162 @@ export abstract class BlockRenderer<TRef = string> {
     this.sendText(chatId, lines.join("\n")).catch(() => {});
   }
 
+  // ---------------------------------------------------------------------------
+  // Permission flow
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Entry point used by the SDK to ask the user for permission.
+   *
+   * Generates a unique callbackId, registers a pending resolver, then delegates
+   * to `onRequestPermission` for the actual UI. The subclass is expected to
+   * eventually call `resolvePermission(callbackId, optionId)` — either
+   * directly (interactive buttons) or through `consumePendingText` parsing
+   * the user's text reply.
+   *
+   * Never rejects on render errors — falls back to the "reject_once" option
+   * if present, otherwise the first option, so the agent is never left hanging.
+   */
+  async requestPermission(request: RequestPermissionRequest): Promise<string> {
+    const chatId = request.sessionId;
+    const callbackId = generateCallbackId();
+    // Only one pending per chat. A new request on the same chat implicitly
+    // cancels the old (shouldn't happen in practice because ACP serializes
+    // per-session, but keep the invariant explicit).
+    const prior = this.pendingByChat.get(chatId);
+    if (prior) {
+      this.resolvePermissionInternal(prior, null);
+    }
+
+    const options: ReadonlyArray<{ kind: string; optionId: string; name: string }> =
+      (request.options ?? []).map((o) => ({
+        kind: String(o.kind ?? ""),
+        optionId: String(o.optionId ?? ""),
+        name: String(o.name ?? ""),
+      }));
+
+    return new Promise<string>((resolve, reject) => {
+      this.pendingPermissions.set(callbackId, { resolve, reject, chatId, options });
+      this.pendingByChat.set(chatId, callbackId);
+      Promise.resolve(this.onRequestPermission(chatId, request, callbackId)).catch((err) => {
+        // Render failed — fall back so the agent is never stuck.
+        if (!this.pendingPermissions.has(callbackId)) return;
+        this.pendingPermissions.delete(callbackId);
+        if (this.pendingByChat.get(chatId) === callbackId) {
+          this.pendingByChat.delete(chatId);
+        }
+        const fallback = fallbackOptionId(request);
+        if (fallback) {
+          resolve(fallback);
+        } else {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
+    });
+  }
+
+  /**
+   * Resolve a pending permission request. Call this from the bot when the
+   * user clicks a button / invokes a callback with the matching `callbackId`.
+   *
+   * @returns `true` if a pending request was resolved, `false` otherwise.
+   */
+  resolvePermission(callbackId: string, optionId: string): boolean {
+    return this.resolvePermissionInternal(callbackId, optionId);
+  }
+
+  /**
+   * Feed a new user text message into the pending permission flow for this chat.
+   *
+   * Semantics:
+   *   - Parseable answer (number / keyword / optionId)  → resolve + return `true`
+   *     (message consumed, bot should NOT forward).
+   *   - Not parseable, but there IS a pending permission → implicit cancel
+   *     (resolve as `reject_once`) + return `false` (message NOT consumed; bot
+   *     should forward as a new prompt — the reject gracefully ends the stalled
+   *     turn and lets the user's new message start a fresh one).
+   *   - No pending → return `false` (nothing to do).
+   *
+   * Bots should call this before forwarding a user text message to
+   * `agent.prompt()`:
+   *
+   * ```ts
+   * if (streamHandler.consumePendingText(chatId, text)) return;
+   * // else: forward as new prompt
+   * ```
+   */
+  consumePendingText(chatId: string, text: string): boolean {
+    const callbackId = this.pendingByChat.get(chatId);
+    if (!callbackId) return false;
+    const entry = this.pendingPermissions.get(callbackId);
+    if (!entry) {
+      this.pendingByChat.delete(chatId);
+      return false;
+    }
+
+    const parsed = tryParsePermissionAnswer(text, entry.options);
+    if (parsed) {
+      this.resolvePermissionInternal(callbackId, parsed);
+      return true;
+    }
+
+    // No match — implicit cancel as reject_once (safer than allow).
+    const rejectId =
+      entry.options.find((o) => o.kind === "reject_once")?.optionId ??
+      entry.options.find((o) => o.kind === "reject_always")?.optionId ??
+      entry.options[0]?.optionId ??
+      null;
+    this.resolvePermissionInternal(callbackId, rejectId);
+    return false;
+  }
+
+  /**
+   * Render a permission request to the user. Eventually the user should
+   * respond — either via button click → `resolvePermission(callbackId, optionId)`,
+   * or via text reply → the bot calls `consumePendingText(chatId, text)` before
+   * forwarding, which parses the text and resolves for us.
+   *
+   * Default implementation: send a numbered text prompt. That's it — we do
+   * NOT loop, because `consumePendingText` drives the flow from the bot side.
+   * Tier-1 platforms with interactive components should override to render
+   * buttons / inline keyboards instead.
+   */
+  protected async onRequestPermission(
+    chatId: string,
+    request: RequestPermissionRequest,
+    _callbackId: string,
+  ): Promise<void> {
+    const options = request.options ?? [];
+    const toolTitle =
+      (request.toolCall as { title?: string } | undefined)?.title ?? "the agent";
+    const header = `🔐 Permission required — ${toolTitle}`;
+    const numbered = options.map((opt, i) => `  ${i + 1}. ${opt.name}`);
+    const hint = `Reply with a number (1-${options.length}). Any other message cancels and continues.`;
+    const prompt = [header, "", ...numbered, "", hint].join("\n");
+    await this.sendText(chatId, prompt);
+  }
+
+  /** Internal: resolve a pending permission, maintaining both lookup tables.
+   *  Pass `null` for optionId to treat the resolution as "cancelled" — in
+   *  that case the resolver is not called, the agent-side Promise stays
+   *  pending (caller should only use null when replacing with a new pending
+   *  on the same chat, which shouldn't happen in practice). */
+  private resolvePermissionInternal(
+    callbackId: string,
+    optionId: string | null,
+  ): boolean {
+    const entry = this.pendingPermissions.get(callbackId);
+    if (!entry) return false;
+    this.pendingPermissions.delete(callbackId);
+    if (this.pendingByChat.get(entry.chatId) === callbackId) {
+      this.pendingByChat.delete(entry.chatId);
+    }
+    if (optionId !== null) {
+      entry.resolve(optionId);
+    }
+    return true;
+  }
+
   /**
    * Call this after `agent.prompt()` resolves (turn complete).
    *
@@ -404,12 +885,7 @@ export abstract class BlockRenderer<TRef = string> {
   // ---------------------------------------------------------------------------
 
   private appendToBlock(chatId: string, kind: BlockKind, delta: string): void {
-    let state = this.states.get(chatId);
-    if (!state) {
-      // Auto-create state if onPromptSent wasn't called (e.g. host-initiated turns)
-      state = { blocks: [], flushTimer: null, lastEditMs: 0, sendChain: Promise.resolve() };
-      this.states.set(chatId, state);
-    }
+    const state = this.ensureState(chatId);
 
     const last = state.blocks.at(-1);
 
